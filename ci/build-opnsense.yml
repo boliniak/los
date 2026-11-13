@@ -1,0 +1,108 @@
+name: Build OPNsense image (Mono Gateway, aarch64)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Wersja setow OPNsense na mirrorze (base/packages)"
+        default: "26.1.1"
+        required: true
+      settings:
+        description: "SETTINGS opnsense/tools (seria)"
+        default: "26.1"
+        required: true
+      mirror:
+        description: "Mirror z setami aarch64"
+        default: "https://opnsense.mono.si"
+        required: true
+      deps_ref:
+        description: "Branch/tag we-are-mono/opnsense-deps"
+        default: "master"
+        required: true
+      tools_ref:
+        description: "Branch/tag opnsense/tools"
+        default: "master"
+        required: true
+  push:
+    paths:
+      - ".github/workflows/build-opnsense.yml"
+      - "scripts/build-gateway.sh"
+
+concurrency:
+  group: opnsense-gateway-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      VERSION: ${{ inputs.version || '26.1.1' }}
+      SETTINGS: ${{ inputs.settings || '26.1' }}
+      MIRROR: ${{ inputs.mirror || 'https://opnsense.mono.si' }}
+      DEPS_REF: ${{ inputs.deps_ref || 'master' }}
+      TOOLS_REF: ${{ inputs.tools_ref || 'master' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Zwolnij miejsce na dysku runnera (obraz VM + /usr/obj ~ 25-30 GB)
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift \
+                      /usr/local/share/powershell /usr/local/share/chromium /opt/microsoft || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          sudo swapoff -a && sudo rm -f /mnt/swapfile /swapfile || true
+          df -h /
+
+      - name: Sprawdz dostepnosc setow na mirrorze
+        run: |
+          base="${MIRROR}/FreeBSD:14:aarch64/${SETTINGS}/sets"
+          for f in "base-${VERSION}-aarch64.txz" "packages-${VERSION}-aarch64.tar"; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -I --max-time 60 "${base}/${f}" || echo 000)
+            echo "${base}/${f} -> HTTP ${code}"
+            if [ "${code}" != "200" ]; then
+              echo "::warning::Nie mozna potwierdzic ${f} na mirrorze (HTTP ${code}). Sprawdz ${base}/ i ewentualnie zmien input 'version'."
+            fi
+          done
+
+      - name: Build w FreeBSD 14.3 (vmactions/freebsd-vm)
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.3"
+          mem: 12288
+          sync: rsync
+          copyback: true
+          envs: "VERSION SETTINGS MIRROR DEPS_REF TOOLS_REF"
+          prepare: |
+            pkg install -y git aarch64-binutils qemu-user-static python3 rsync
+          run: |
+            df -h
+            { OUTDIR="$(pwd)/out" sh scripts/build-gateway.sh; echo $? > .build_rc; } 2>&1 | tee build.log
+            exit "$(cat .build_rc)"
+
+      - name: Lista artefaktow
+        if: always()
+        run: ls -lh out/ 2>/dev/null || echo "Brak katalogu out/"
+
+      - name: Upload obrazu
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OPNsense-${{ env.VERSION }}-arm-aarch64-GATEWAY
+          path: |
+            out/*.img.gz
+            out/*.pkg
+            out/SHA256SUMS
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload logu budowy
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
